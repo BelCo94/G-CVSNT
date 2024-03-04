@@ -4457,8 +4457,6 @@ int start_server (int verify_only)
 	{
 		if(current_parsed_root->username)
 		{
-			if(client_protocol->logout)
-				client_protocol->logout(client_protocol);
 			error (1, 0,
 				"authorization failed: server %s rejected access to %s for user %s",
 				current_parsed_root->hostname, current_parsed_root->directory, current_parsed_root->username);
@@ -4488,8 +4486,6 @@ int start_server (int verify_only)
 			 */
 				if(current_parsed_root->username)
 				{
-					if(client_protocol->logout)
-					   client_protocol->logout(client_protocol);
 					error (1, 0,
 						"authorization failed: server %s rejected access to %s for user %s",
 						current_parsed_root->hostname, current_parsed_root->directory, current_parsed_root->username);
