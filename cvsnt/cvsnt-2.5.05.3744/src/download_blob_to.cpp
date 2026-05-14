@@ -12,9 +12,115 @@
 #include "../ca_blobs_fs/streaming_blobs.h"
 
 #include "error.h"
+#include <cstdlib>
+#include <sys/stat.h>
+#if defined(__APPLE__)
+  #include <sys/clonefile.h>
+#elif defined(__linux__)
+  #include <sys/ioctl.h>
+  #include <linux/fs.h>
+  #include <fcntl.h>
+  #include <unistd.h>
+#elif defined(_WIN32)
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+#endif
+
 extern int change_mode(const char *filename, const char *mode_string, int respect_umask);
 extern void change_utime(const char* filename, time_t timestamp);
 extern int unlink_file(const char* filename);
+
+//Optional fast path: when a co-located proxy is running with store_unpacked, the client can read
+//the already-decoded blob file directly from the proxy's cache folder and copy/reflink it into
+//the working tree instead of going over the network. Triggered by CVS_PROXY_BLOBS_UNPACKED_DIR.
+static bool unpacked_cache_enabled = false;
+static std::string unpacked_cache_dir;//ends with '/'
+
+static void init_unpacked_cache()
+{
+  const char *env = std::getenv("CVS_PROXY_BLOBS_UNPACKED_DIR");
+  if (!env || !env[0])
+    return;
+  struct stat st;
+  if (stat(env, &st) != 0 || (st.st_mode & S_IFDIR) == 0)
+    return;
+  unpacked_cache_dir = env;
+  const char last = unpacked_cache_dir.back();
+  if (last != '/' && last != '\\')
+    unpacked_cache_dir += '/';
+  unpacked_cache_enabled = true;
+}
+
+static std::string unpacked_file_path(const std::string &hash)
+{
+  //layout: <unpacked_dir>/XX/YY/<hash>_unpacked  (XX = hash[0..1], YY = hash[2..3])
+  std::string p = unpacked_cache_dir;
+  p.append(hash, 0, 2); p += '/';
+  p.append(hash, 2, 2); p += '/';
+  p += hash;
+  p += "_unpacked";
+  return p;
+}
+
+//Copy or reflink an already-decoded blob from src to dst.
+//Returns true only when dst is a complete, valid copy ready for change_mode/rename.
+//Returns false silently on missing source (cold-cache is the common case).
+static bool try_copy_unpacked(const char *src, const char *dst)
+{
+#if defined(__APPLE__)
+  unlink_file(dst);//clonefile fails if dst exists
+  if (clonefile(src, dst, 0) == 0)
+    return true;
+  //fall through to plain copy below
+#elif defined(__linux__)
+  int src_fd = ::open(src, O_RDONLY);
+  if (src_fd < 0)
+    return false;
+  int dst_fd = ::open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (dst_fd < 0) { ::close(src_fd); return false; }
+  const bool ok = (ioctl(dst_fd, FICLONE, src_fd) == 0);
+  ::close(dst_fd);
+  ::close(src_fd);
+  if (ok)
+    return true;
+  unlink_file(dst);
+  //fall through to plain copy below
+#elif defined(_WIN32)
+  if (CopyFileA(src, dst, FALSE))
+    return true;
+  return false;
+#endif
+
+#if !defined(_WIN32)
+  FILE *s = std::fopen(src, "rb");
+  if (!s)
+    return false;
+  FILE *d = std::fopen(dst, "wb");
+  if (!d) { std::fclose(s); return false; }
+  char buf[64 * 1024];
+  size_t n;
+  while ((n = std::fread(buf, 1, sizeof(buf), s)) > 0)
+  {
+    if (std::fwrite(buf, 1, n, d) != n)
+    {
+      std::fclose(d); std::fclose(s);
+      unlink_file(dst);
+      return false;
+    }
+  }
+  const bool ok = (std::ferror(s) == 0);
+  std::fclose(d); std::fclose(s);
+  if (!ok) { unlink_file(dst); return false; }
+  return true;
+#else
+  return false;
+#endif
+}
 
 struct BlobTask
 {
@@ -238,6 +344,8 @@ void BackgroundProcessor::init()
   if (is_inited())
     return;
 
+  init_unpacked_cache();
+
   int threads_count = std::min(8, std::max(1, (int)std::thread::hardware_concurrency()-1));//limit concurrency to fixed
   const char *config_url = nullptr;
   const char *repo = nullptr;
@@ -368,6 +476,28 @@ static bool download_blob_ref_file(BlobNetworkProcessor *processor, const BlobTa
   const bool validateHash = !task.noWrite && validate_downloaded_blobs;
   std::string temp_filename = task.dirpath +"/_new_";
   temp_filename += task.filename;
+
+  //Fast path: try to obtain the decoded blob directly from a co-located proxy's unpacked cache.
+  //On success skip the network and decompression entirely. On any failure (missing source, copy
+  //error, etc.) we silently fall through to the normal network download below, which itself will
+  //populate the proxy's cache for next time.
+  if (unpacked_cache_enabled && !task.noWrite && task.encoded_hash.size() >= 4)
+  {
+    const std::string src = unpacked_file_path(task.encoded_hash);
+    if (try_copy_unpacked(src.c_str(), temp_filename.c_str()))
+    {
+      const std::string fullPath = task.dirpath + "/" + task.filename;
+      const int status = change_mode(temp_filename.c_str(), task.file_mode.c_str(), 1);
+      if (status != 0)
+        error(0, status, "cannot change mode of %s", task.filename.c_str());
+      rename_file(temp_filename.c_str(), fullPath.c_str());
+      change_utime(fullPath.c_str(), task.timestamp);
+      char buf[256]; std::snprintf(buf, sizeof(buf), "u %s\n", task.message.c_str());
+      cvs_output(buf, 0);
+      return true;
+    }
+  }
+
   size_t readUncompressedSz = ~size_t(0);
   for (int i = 0; i < 16; ++i)//make 16 attempts
   {
