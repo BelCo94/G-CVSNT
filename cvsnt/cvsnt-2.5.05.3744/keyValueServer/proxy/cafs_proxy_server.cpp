@@ -8,7 +8,7 @@
 #define BLOB_LOG_LEVEL LOG_WARNING
 #include "../sampleImplementation/def_log_printf.cpp"
 
-void init_proxy(const char *url, int port, const char *cache, uint64_t sz, const char *encryption_secret, CafsClientAuthentication auth_on_master, bool update_mtimes, bool validate_blobs);
+void init_proxy(const char *url, int port, const char *cache, uint64_t sz, const char *encryption_secret, CafsClientAuthentication auth_on_master, bool update_mtimes, bool validate_blobs, bool store_unpacked);
 void close_proxy();
 extern bool proxy_allow_push;
 
@@ -16,7 +16,7 @@ int main(int argc, const char **argv)
 {
   if (argc < 3)
   {
-    printf("Usage is cafs_proxy_server master_url cache_folder [validate_blobs_from_master] [update_mtime_on_access] [encryption/mandatory_encryption secret] [cache_soft_limit_size (mb). default is 102400 == 100Gb]\n");
+    printf("Usage is cafs_proxy_server master_url cache_folder [validate_blobs_from_master] [update_mtime_on_access] [store_unpacked] [encryption/mandatory_encryption secret] [cache_soft_limit_size (mb). default is 102400 == 100Gb]\n");
     return 1;
   }
   if (!blob_init_sockets())
@@ -27,7 +27,7 @@ int main(int argc, const char **argv)
   const char *encryption_secret = 0;
   CafsServerEncryption encryption = CafsServerEncryption::Local;
   CafsClientAuthentication auth_on_master = CafsClientAuthentication::AllowNoAuthPrivate;
-  bool update_mtimes = false, validate_blobs = false;
+  bool update_mtimes = false, validate_blobs = false, store_unpacked = false;
   int pc = 3;
   for (; pc < argc;)
   {
@@ -55,14 +55,19 @@ int main(int argc, const char **argv)
     {
       validate_blobs = true;
       ++pc;
+    } else if (strcmp(argv[pc], "store_unpacked") == 0)
+    {
+      store_unpacked = true;
+      ++pc;
     }
     else break;
   }
   const int master_port = 2403;
-  init_proxy(argv[1], master_port, argv[2], argc>pc ? atoi(argv[pc]) : 100*1024, encryption_secret, auth_on_master, update_mtimes, validate_blobs);
-  printf("Starting %s%s server listening at port %d%s\n",
+  init_proxy(argv[1], master_port, argv[2], argc>pc ? atoi(argv[pc]) : 100*1024, encryption_secret, auth_on_master, update_mtimes, validate_blobs, store_unpacked);
+  printf("Starting %s%s server listening at port %d%s%s\n",
     encryption == CafsServerEncryption::Public ? "optional " : " ", encryption_secret ? "encrypted" : "local only", master_port,
-    update_mtimes ? ", blob mtimes modified on access" : "");
+    update_mtimes ? ", blob mtimes modified on access" : "",
+    store_unpacked ? ", storing unpacked blobs" : "");
   const bool result = start_push_server(master_port, 1024, nullptr, encryption_secret, encryption);
   printf("server quit %s", result ? "with error\n" :"normally\n");
   close_proxy();

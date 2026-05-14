@@ -10,12 +10,14 @@
 #include "../include/blob_client_lib.h"
 #include "../include/blob_sockets.h"
 #include "../blob_push_log.h"
+#include "../../ca_blobs_fs/ca_blob_format.h"
 
 static std::string master_url;
 static std::string cache_folder, blobs_folder, encryption_secret;
 static CafsClientAuthentication auth_on_master_as_client = CafsClientAuthentication::AllowNoAuthPrivate;
 static int master_port = 2403;
-static bool should_update_mtimes_on_access = false, should_validate_blobs = false;
+static bool should_update_mtimes_on_access = false, should_validate_blobs = false, should_store_unpacked = false;
+static std::string blobs_unpacked_folder;
 //--
 void init_gc(const char *folder, uint64_t max_size);
 void close_gc();
@@ -26,7 +28,7 @@ void update_write_time_to_current(const char*name);
 
 //
 void close_proxy(){close_gc();}
-void init_proxy(const char *url, int port, const char *cache, uint64_t sz, const char *secret, CafsClientAuthentication auth_on_master, bool update_mtimes, bool validate_blobs)
+void init_proxy(const char *url, int port, const char *cache, uint64_t sz, const char *secret, CafsClientAuthentication auth_on_master, bool update_mtimes, bool validate_blobs, bool store_unpacked)
 {
   if (auth_on_master == CafsClientAuthentication::RequiresAuth && !secret)
   {
@@ -50,6 +52,13 @@ void init_proxy(const char *url, int port, const char *cache, uint64_t sz, const
   blob_fileio_ensure_dir(blobs_folder.c_str());
   should_update_mtimes_on_access = update_mtimes;
   should_validate_blobs = validate_blobs;
+  should_store_unpacked = store_unpacked;
+  if (should_store_unpacked)
+  {
+    blobs_unpacked_folder = cache_folder + "blobs_unpacked/";
+    blob_fileio_ensure_dir(blobs_unpacked_folder.c_str());
+  }
+  //GC walks the whole cache_folder. In store_unpacked mode only blobs_unpacked/ is populated; the cap must be sized for decoded (uncompressed) content.
   init_gc(cache_folder.c_str(), uint64_t(sz)<<uint64_t(20));
 }
 ///
@@ -193,9 +202,41 @@ std::string get_hash_file_name(const char* htype, const char* hhex)
   return get_hash_file_folder(htype, hhex) + hhex;
 }
 
+static std::string get_unpacked_file_folder(const char* /*htype*/, const char* hhex)
+{
+  char sub[7] = {hhex[0], hhex[1], '/', hhex[2], hhex[3], '/', '\0'};
+  return (blobs_unpacked_folder + sub);
+}
+
+static void ensure_unpacked_dir(const char* htype, const char* hhex)
+{
+  std::string dir = get_unpacked_file_folder(htype, hhex);
+  dir[dir.length()-4] = 0;
+  blob_fileio_ensure_dir(dir.c_str());
+  dir[dir.length()-4] = '/';
+  blob_fileio_ensure_dir(dir.c_str());
+}
+
+static std::string get_unpacked_file_name(const char* htype, const char* hhex)
+{
+  if (!hhex || !hhex[0] || !hhex[1] || !hhex[2] || !hhex[3])
+    return std::string();
+  return get_unpacked_file_folder(htype, hhex) + std::string(hhex) + "_unpacked";
+}
+
 uint64_t blob_get_hash_blob_size(const void *c, const char* htype, const char* hhex) {
   //we return local file size if exist. If blob was removed from master that would cause ability to checkout non-existent blob (but the one that existed earlier)
   //if blob has changed on server (repacked) we will return cached local size anyway
+  if (should_store_unpacked)
+  {
+    const std::string unpackedFn = get_unpacked_file_name(htype, hhex);
+    if (unpackedFn.length())
+    {
+      const uint64_t unpackedSz = blob_fileio_get_file_size(unpackedFn.c_str());
+      if (unpackedSz != invalid_blob_file_size)
+        return unpackedSz + sizeof(caddressed_fs::BlobHeader);
+    }
+  }
   const uint64_t cachedSz = blob_fileio_get_file_size(get_hash_file_name(htype, hhex).c_str());
   if (cachedSz != invalid_blob_file_size)
     return cachedSz;
@@ -301,6 +342,8 @@ struct PullThroughTemp
   int64_t pulledSz = 0;
   bool tempIsOk = true;
   enum {NOT_VALIDATING, VALIDATING, INVALID, VALID} validateDownloadedHash = NOT_VALIDATING;
+  std::string storedHtype, storedHhex;
+  bool needDecode = false;
 
   bool start(const ClientConnection *c, const char* htype, const char* hhex, uint64_t &sz)
   {
@@ -310,6 +353,8 @@ struct PullThroughTemp
       fprintf(stderr, "No client connection\n");
       return false;
     }
+    storedHtype = htype;
+    storedHhex = hhex;
 
     pulledSz = 0;
     for (int i = 0; i < 100; ++i)
@@ -332,18 +377,30 @@ struct PullThroughTemp
     }
     //report_to_gc_needed_space(expectedSize);
     pulledSz = 0;
-    tmpf = blob_fileio_get_temp_file(tmpfn, blobs_folder.c_str());
-    if (!tmpf)
-      fprintf(stderr, "Can't open temp file %s. Will perform net proxying.\n", tmpfn.c_str());
-    else
-      ensure_dir(htype, hhex);
+    if (should_store_unpacked)
+    {
+      tmpf = blob_fileio_get_temp_file(tmpfn, blobs_unpacked_folder.c_str());
+      if (!tmpf)
+        fprintf(stderr, "Can't open unpacked temp file %s. Will perform net proxying.\n", tmpfn.c_str());
+      else
+        ensure_unpacked_dir(htype, hhex);
+    } else
+    {
+      tmpf = blob_fileio_get_temp_file(tmpfn, blobs_folder.c_str());
+      if (!tmpf)
+        fprintf(stderr, "Can't open temp file %s. Will perform net proxying.\n", tmpfn.c_str());
+      else
+        ensure_dir(htype, hhex);
+    }
     tempIsOk = tmpf != nullptr;
 
+    needDecode = should_validate_blobs || should_store_unpacked;
+    if (needDecode)
+      info = caddressed_fs::DownloadBlobInfo{};
     if (should_validate_blobs)
     {
       hex_string_to_bin_hash(hhex, strlen(hhex), requestedBinHash, sizeof(requestedBinHash));
       init_blob_hash_context(hashCtx, sizeof(hashCtx));
-      info = caddressed_fs::DownloadBlobInfo{};
       validateDownloadedHash = VALIDATING;
     } else
       validateDownloadedHash = NOT_VALIDATING;
@@ -379,13 +436,30 @@ struct PullThroughTemp
     read = 0;
     if (readChunk([&](const char *data, int len)
     {
-      if (validateDownloadedHash == VALIDATING)
+      if (needDecode)
       {
         if (!caddressed_fs::decode_stream_blob_data(info, data, len,
-            [&](const void *decoded_data, size_t sz) { update_blob_hash(hashCtx, (const char *)decoded_data, sz); return true;}))
-          validateDownloadedHash = INVALID;
+            [&](const void *decoded_data, size_t sz) {
+              if (validateDownloadedHash == VALIDATING)
+                update_blob_hash(hashCtx, (const char *)decoded_data, sz);
+              if (should_store_unpacked && tempIsOk)
+              {
+                tempIsOk = (blob_fwrite64(decoded_data, 1, sz, tmpf) == sz);
+                if (!tempIsOk)
+                {
+                  fprintf(stderr, "Couldn't write to unpacked temp <%s>, err=%d.\n", tmpfn.c_str(), blob_fileio_get_last_error());
+                  perform_immediate_gc(expectedSize*2);
+                  closeAndUnlink();
+                }
+              }
+              return true;
+            }))
+        {
+          if (validateDownloadedHash == VALIDATING)
+            validateDownloadedHash = INVALID;
+        }
       }
-      if (tempIsOk)
+      if (!should_store_unpacked && tempIsOk)
       {
         tempIsOk = (blob_fwrite64(buf, 1, len, tmpf) == len);
         if (!tempIsOk)
@@ -426,13 +500,28 @@ struct PullThroughTemp
       closeAndUnlink();
       return false;
     }
-    const int64_t fileSz = blob_fileio_get_file_size(tmpfn.c_str());
-    if (fileSz != pulledSz)
+
+    if (should_store_unpacked)
     {
-      fprintf(stderr, "Downloaded file %s for %s is of %lld size, while should be %lld\n", tmpfn.c_str(), fn.c_str(),
-        (long long int)fileSz, (long long int)pulledSz);
-      closeAndUnlink();
-      return false;
+      //for unpacked mode, tmpf holds decoded data; verify size against decoded size
+      const int64_t fileSz = blob_fileio_get_file_size(tmpfn.c_str());
+      if (fileSz != (int64_t)info.realUncompressedSize)
+      {
+        fprintf(stderr, "Unpacked file %s is %lld bytes, while decoded size is %lld\n", tmpfn.c_str(),
+          (long long int)fileSz, (long long int)info.realUncompressedSize);
+        closeAndUnlink();
+        return false;
+      }
+    } else
+    {
+      const int64_t fileSz = blob_fileio_get_file_size(tmpfn.c_str());
+      if (fileSz != pulledSz)
+      {
+        fprintf(stderr, "Downloaded file %s for %s is of %lld size, while should be %lld\n", tmpfn.c_str(), fn.c_str(),
+          (long long int)fileSz, (long long int)pulledSz);
+        closeAndUnlink();
+        return false;
+      }
     }
 
     if (validateDownloadedHash == VALIDATING)
@@ -444,7 +533,7 @@ struct PullThroughTemp
         char requestedBinHexHash[65], receivedBinHexHash[65];
         bin_hash_to_hex_string_s(requestedBinHash, requestedBinHexHash, sizeof(requestedBinHexHash));
         bin_hash_to_hex_string_s(digest, receivedBinHexHash, sizeof(receivedBinHexHash));
-        fprintf(stderr, "Downloaded hash is %s (%lld bytes), while requested was %s\n", receivedBinHexHash, (long long int)fileSz, requestedBinHexHash);
+        fprintf(stderr, "Downloaded hash is %s (%lld bytes), while requested was %s\n", receivedBinHexHash, (long long int)pulledSz, requestedBinHexHash);
         validateDownloadedHash = INVALID;
       } else
         validateDownloadedHash = VALID;
@@ -452,7 +541,7 @@ struct PullThroughTemp
     {
       char requestedBinHexHash[65];
       bin_hash_to_hex_string_s(requestedBinHash, requestedBinHexHash, sizeof(requestedBinHexHash));
-      fprintf(stderr, "Could not decode blob %s (%lld bytes) from server\n", requestedBinHexHash, (long long int)fileSz);
+      fprintf(stderr, "Could not decode blob %s (%lld bytes) from server\n", requestedBinHexHash, (long long int)pulledSz);
       return false;
     }
     if (validateDownloadedHash == INVALID)
@@ -467,16 +556,21 @@ struct PullThroughTemp
     tmpf = NULL;
     #endif
 
-    if (!blob_fileio_rename_file_if_nexist(tmpfn.c_str(), fn.c_str()))//can't rename
+    const std::string finalFn = should_store_unpacked
+      ? get_unpacked_file_name(storedHtype.c_str(), storedHhex.c_str())
+      : fn;
+    if (!blob_fileio_rename_file_if_nexist(tmpfn.c_str(), finalFn.c_str()))//can't rename
     {
       const int err = blob_fileio_get_last_error();
       closeAndUnlink();
-      fprintf(stderr, "Can't rename file %s to %s, because of %d\n", tmpfn.c_str(), fn.c_str(), err);
+      fprintf(stderr, "Can't rename file %s to %s, because of %d\n", tmpfn.c_str(), finalFn.c_str(), err);
       return false;
     }
     if (tmpf)
       fclose(tmpf);//we close file only after we have started pull. That way GC thread won't delete file
-    lazy_report_to_gc(fileSz);
+    //asymmetric on purpose: packed file on disk includes the 16-byte header, unpacked file is raw decoded body only.
+    const int64_t reportSz = should_store_unpacked ? (int64_t)info.realUncompressedSize : blob_fileio_get_file_size(finalFn.c_str());
+    lazy_report_to_gc(reportSz);
     return true;
   }
 };
@@ -486,11 +580,36 @@ struct BlobProxyPull
 public:
   const char *pull(uint64_t from, uint64_t &read)
   {
+    if (isUnpacked) return pullCachedUnpacked(from, read);
     return isCached() ? pullCached(from, read) : pullWriteThrough(from, read);
   }
 
   bool start(const ClientConnection *cc, const char* htype, const char* hhex, uint64_t &sz)
   {
+    //try unpacked cache first
+    if (should_store_unpacked)
+    {
+      unpackedFileName = get_unpacked_file_name(htype, hhex);
+      if (unpackedFileName.length())
+      {
+        uint64_t fileSz = 0;
+        cached = blobe_fileio_start_pull(unpackedFileName.c_str(), fileSz);
+        if (cached)
+        {
+          isUnpacked = true;
+          sz = fileSz + sizeof(caddressed_fs::BlobHeader);
+          memcpy(syntheticHeader.magic, caddressed_fs::noarc_magic, caddressed_fs::BLOB_MAGIC_SIZE);
+          syntheticHeader.headerSize = sizeof(caddressed_fs::BlobHeader);
+          syntheticHeader.flags = 0;
+          syntheticHeader.uncompressedLen = fileSz;
+          if (cc)
+            cc->add_accessed_file(unpackedFileName.c_str());
+          return true;
+        }
+      }
+    }
+
+    //try regular cached blob
     cacheFileName = get_hash_file_name(htype, hhex);
     if (!cacheFileName.length())
     {
@@ -530,8 +649,31 @@ private:
     if (!cached){read = 0;return nullptr;}
     return blobe_fileio_pull(cached, from, read);
   }
+
+  const char *pullCachedUnpacked(uint64_t from, uint64_t &read)
+  {
+    static_assert(sizeof(caddressed_fs::BlobHeader) == 16, "synthetic header layout assumes 16-byte BlobHeader");
+    if (from < sizeof(caddressed_fs::BlobHeader))
+    {
+      read = sizeof(caddressed_fs::BlobHeader) - from;
+      return ((const char*)&syntheticHeader) + from;
+    }
+    if (!cached){read = 0;return nullptr;}
+    //get base mmap pointer via existing API
+    uint64_t fileRead = 0;
+    const char *base = blobe_fileio_pull(cached, 0, fileRead);
+    if (!base){read = 0;return nullptr;}
+    uint64_t fileOffset = from - sizeof(caddressed_fs::BlobHeader);
+    if (fileOffset >= fileRead){read = 0;return nullptr;}
+    read = fileRead - fileOffset;
+    return base + fileOffset;
+  }
+
   bool isCached() const {return cached != nullptr;};
+  bool isUnpacked = false;
   std::string cacheFileName;
+  std::string unpackedFileName;
+  caddressed_fs::BlobHeader syntheticHeader = {};
   BlobFileIOPullData *cached = nullptr;
   PullThroughTemp writeThrough;
 };
