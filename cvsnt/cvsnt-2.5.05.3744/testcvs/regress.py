@@ -153,6 +153,28 @@ class PserverShim:
         conn.close()
 
 
+@contextlib.contextmanager
+def local_and_pserver(r):
+    """Yield (name, CVSROOT) for r.repo locally and over a PserverShim
+    :pserver: session, so one test body runs both client paths."""
+    shim = PserverShim(r.repo.replace(os.sep, "/"))
+    try:
+        yield (("local", r.repo), ("pserver", shim.root()))
+    finally:
+        # The root's password was saved; remove it.
+        run(["-d", shim.root(), "logout"], cwd=r.root, expect_ok=False)
+        shim.close()
+
+
+def rev_date_author(r, path, rev):
+    """The date and author `cvs rlog` records for revision REV of PATH."""
+    _, out = r.cvs(["rlog", "-r" + rev, path], cwd=r.root)
+    m = re.search(r"^date: ([^;]+);\s+author: ([^;]+);", out, re.M)
+    if not check(m is not None, "no date/author for %s %s in rlog:\n%s" % (path, rev, out)):
+        return "?", "?"
+    return m.group(1), m.group(2)
+
+
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="\n") as f:
@@ -389,6 +411,83 @@ def t_sticky(r):
     _, out = r.cvs(["status", "a.txt"], cwd=wc)
     check(re.search(r"Sticky Tag:\s+\(none\)", out) is not None,
           "sticky tag not cleared by update -A:\n" + out)
+
+
+@test("update -r and -D stick in every directory of a walk, update -A clears them, local and server")
+def t_sticky_walk(r):
+    # Every directory of a walk opens and closes its mapping state with the
+    # walk's tag and date, so the walk spans three directory levels.
+    files = ("a.txt", "sub/b.txt", "sub/deep/c.txt")
+    r.import_tree("m", {f: "one\n" for f in files})
+    wc = r.checkout("m")
+    r.cvs(["tag", "REL1"], cwd=wc)
+    # import stamps each file on its own, so take the latest 1.1 date
+    date = max(rev_date_author(r, "m/" + f, "1.1")[0] for f in files) + " UTC"
+    time.sleep(1.1)  # the second revision must be past that date
+    for f in files:
+        write(os.path.join(wc, f), "one\ntwo\n")
+    r.cvs(["commit", "-m", "second"], cwd=wc)
+
+    with local_and_pserver(r) as roots:
+        for name, root in roots:
+            wcroot = os.path.join(r.root, "wc-" + name)
+            os.makedirs(wcroot)
+            run(["-d", root, "checkout", "m"], cwd=wcroot)
+            wc = os.path.join(wcroot, "m")
+            for opt, sticky in ((["-r", "REL1"], r"Sticky Tag:\s+REL1"),
+                                (["-D", date], r"Sticky Date:\s+\d")):
+                what = "%s: update %s" % (name, " ".join(opt))
+                run(["update"] + opt, cwd=wc)
+                for f in files:
+                    check_eq(read(os.path.join(wc, f)), "one\n", "%s: content of %s" % (what, f))
+                _, out = run(["status"], cwd=wc)
+                check_eq(len(re.findall(sticky, out)), len(files),
+                         "%s: files with the sticky setting\n%s" % (what, out))
+
+                run(["update", "-A"], cwd=wc)
+                for f in files:
+                    check_eq(read(os.path.join(wc, f)), "one\ntwo\n",
+                             "%s, then -A: content of %s" % (what, f))
+                _, out = run(["status"], cwd=wc)
+                check_eq(len(re.findall(r"Sticky (?:Tag|Date):\s+\(none\)", out)), 2 * len(files),
+                         "%s, then -A: files with no sticky tag and date\n%s" % (what, out))
+
+
+@test("keywords expand the same in every repeated token, on trunk and branch, local and server")
+def t_keyword_expansion(r):
+    # The expected forms are the ones the binary produced before the leak fixes.
+    # On the trunk $Branch$ has no value and stays unexpanded.
+    tokens = "$Id$ $Date$ $Revision$ $Author$ $Branch$"
+
+    def body(tail):
+        return "".join("%d: %s\n" % (i, tokens) for i in range(3)) + tail + "\n"
+
+    def expanded(rev, branch, tail):
+        date, author = rev_date_author(r, "m/k.txt", rev)
+        line = ("$Id: k.txt,v %s %s %s Exp $ $Date: %s $ $Revision: %s $ $Author: %s $ %s"
+                % (rev, date, author, date, rev, author,
+                   "$Branch: %s $" % branch if branch else "$Branch$"))
+        return "".join("%d: %s\n" % (i, line) for i in range(3)) + tail + "\n"
+
+    r.import_tree("m", {"k.txt": body("vendor")})
+    wc = r.checkout("m")
+    write(os.path.join(wc, "k.txt"), body("trunk"))
+    r.cvs(["commit", "-m", "trunk"], cwd=wc)                  # 1.2
+    r.cvs(["tag", "-b", "BR"], cwd=wc)
+    r.cvs(["update", "-r", "BR"], cwd=wc)
+    write(os.path.join(wc, "k.txt"), body("branch"))
+    r.cvs(["commit", "-m", "branch"], cwd=wc)                 # 1.2.2.1
+    want = {"trunk": expanded("1.2", None, "trunk"),
+            "branch": expanded("1.2.2.1", "BR", "branch")}
+
+    with local_and_pserver(r) as roots:
+        for name, root in roots:
+            for where, opt in (("trunk", []), ("branch", ["-r", "BR"])):
+                wcroot = os.path.join(r.root, "wc-%s-%s" % (name, where))
+                os.makedirs(wcroot)
+                run(["-d", root, "checkout"] + opt + ["m"], cwd=wcroot)
+                check_eq(read(os.path.join(wcroot, "m", "k.txt")), want[where],
+                         "%s checkout on the %s" % (name, where))
 
 
 @test("update -C reverts and leaves a .# backup")
@@ -735,6 +834,51 @@ def t_binary_second_commit(r):
     r.cvs(["update", "-r", "1.1.1.1", "b.dat"], cwd=os.path.join(wc2root, "mb"))
     got = open(os.path.join(wc2root, "mb", "b.dat"), "rb").read()
     check_eq(got, payload1, "first-revision content via update -r")
+
+
+@test("a -kz file checks out every revision and logs its line counts, local and server")
+def t_compressed_revisions(r):
+    # -kz stores the head and every delta deflated.  Checkout inflates the
+    # head and, for an older revision, the deltas back to it; log inflates
+    # every delta to count its lines.
+    def text(drop):
+        # Every line not a multiple of DROP (none dropped for 0), plus a tail.
+        return "".join("line %04d compresses well well well\n" % i
+                       for i in range(300) if not drop or i % drop) + "tail %d\n" % drop
+
+    revs = {"1.1": text(0), "1.2": text(7), "1.3": text(5)}
+    # 1.2 drops the 43 multiples of 7 and the tail and adds its own tail;
+    # 1.3 drops the 51 multiples of 5 that are not of 7 and the tail, and
+    # brings back the 34 multiples of 7 that are not of 5 plus its tail.
+    counts = {"1.2": ("1", "44"), "1.3": ("35", "52")}
+    r.import_tree("m", {"a.txt": "one\n"})
+    wc = r.checkout("m")
+    write(os.path.join(wc, "z.txt"), revs["1.1"])
+    r.cvs(["add", "-kz", "z.txt"], cwd=wc)
+    for rev in sorted(revs):
+        write(os.path.join(wc, "z.txt"), revs[rev])
+        _, out = r.cvs(["commit", "-m", rev], cwd=wc)
+        check(rev in out, "commit did not create %s:\n%s" % (rev, out))
+    with open(os.path.join(r.repo, "m", "z.txt,v"), "rb") as f:
+        stored = f.read()
+    check(b"compressed_text" in stored,
+          "z.txt,v does not store compressed revisions")
+
+    with local_and_pserver(r) as roots:
+        for name, root in roots:
+            wcroot = os.path.join(r.root, "wc-" + name)
+            os.makedirs(wcroot)
+            run(["-d", root, "checkout", "m"], cwd=wcroot)
+            wc = os.path.join(wcroot, "m")
+            check_eq(read(os.path.join(wc, "z.txt")), revs["1.3"], "%s: head" % name)
+            for rev in ("1.1", "1.2"):
+                run(["update", "-r", rev, "z.txt"], cwd=wc)
+                check_eq(read(os.path.join(wc, "z.txt")), revs[rev], "%s: revision %s" % (name, rev))
+            run(["update", "-A", "z.txt"], cwd=wc)
+            _, out = run(["log", "z.txt"], cwd=wc)
+            got = dict((m.group(1), (m.group(2), m.group(3))) for m in re.finditer(
+                r"^revision (\S+)\ndate: [^\n]*lines: \+(\d+) -(\d+);", out, re.M))
+            check_eq(got, counts, "%s: log line counts" % name)
 
 
 @test("interrupted checkout leaves well-formed Entries logs")
@@ -1219,6 +1363,49 @@ def t_old_watch_data_ignored(r):
     check(os.access(os.path.join(wc, "n.txt"), os.W_OK), "n.txt read-only from the old directory default")
     rc, out = r.cvs(["watch", "on"], cwd=wc, expect_ok=False)
     check(rc != 0 and "Unknown command: `watch'" in out, "cvs watch is still a command:\n" + out)
+
+
+@test("each read-denied file in one update prints its own ACL message, local and server")
+def t_acl_deny_message(r):
+    # a.txt carries a default deny and then the user's own, whose message
+    # replaces the default one; c.txt has the user's deny alone.  The
+    # message is the acl's message attribute (chacl -m writes a child
+    # element, which is never read).
+    r.import_tree("m", {"a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n"})
+    user = rev_date_author(r, "m/a.txt", "1.1")[1]
+    msgs = {"a.txt": "a.txt is frozen: ask the release team (ticket #42)",
+            "c.txt": "c.txt is private, see https://example.invalid/acl?file=c.txt&why=1"}
+    acl = '    <acl %smessage="%s"><read deny="1"/></acl>\n'
+    xml = ('<?xml version="1.0"?>\n<fileattr>\n'
+           '  <file name="a.txt">\n%s%s  </file>\n'
+           '  <file name="c.txt">\n%s  </file>\n</fileattr>\n'
+           % (acl % ("", "the default message"),
+              acl % ('user="%s" ' % user, msgs["a.txt"].replace("&", "&amp;")),
+              acl % ('user="%s" ' % user, msgs["c.txt"].replace("&", "&amp;"))))
+
+    with local_and_pserver(r) as roots:
+        wcs = []
+        for name, root in roots:
+            wcroot = os.path.join(r.root, "wc-" + name)
+            os.makedirs(wcroot)
+            run(["-d", root, "checkout", "m"], cwd=wcroot)
+            wcs.append((name, os.path.join(wcroot, "m")))
+        # Updates check read access only for files the working copy has.
+        write(os.path.join(r.repo, "m", "CVS", "fileattr.xml"), xml)
+        for name, wc in wcs:
+            rc, out = run(["update"], cwd=wc, expect_ok=False)
+            check_eq(rc, 1, "%s: update exit status\n%s" % (name, out))
+            lines = out.splitlines()
+            denied = [(i, l.rsplit("/", 1)[-1]) for i, l in enumerate(lines)
+                      if "unable to read from" in l]
+            check_eq([f for _, f in denied], ["a.txt", "c.txt"],
+                     "%s: denied files\n%s" % (name, out))
+            for i, f in denied:
+                check(i + 1 < len(lines) and lines[i + 1].endswith(": " + msgs[f]),
+                      "%s: the message after the denial of %s is missing or damaged\n%s"
+                      % (name, f, out))
+            check("the default message" not in out,
+                  "%s: the user's message did not replace the default one\n%s" % (name, out))
 
 
 @test("the server acks an old client's Notify and refuses watch requests")

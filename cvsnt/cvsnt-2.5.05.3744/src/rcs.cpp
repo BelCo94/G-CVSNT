@@ -659,6 +659,7 @@ void RCS_fully_parse (RCSNode *rcs)
 									error(1,0,"internal error: inflate failed");
 								}
 							}
+                            inflateEnd(&stream);
 							vallen=zlen;
 							value = zbuf;
 						}
@@ -2574,10 +2575,14 @@ char *RCS_getbranch (RCSNode *rcs, const char *tag, int force_tag_match)
 	if(atomic_checkouts)
 	{
 		do_lock_version(rcs->rcsbuf.lockId, branch, &v);
-		xfree(branch);
 		if(v && v[0])
-			return xstrdup(v);
+        {
+            xfree(branch);
+            return v;
+        }
+        xfree(v);
 	}
+    xfree(branch);
 
 	if(!strcmp(tag,"HEAD"))
 		return RCS_head(rcs);
@@ -2851,7 +2856,10 @@ char *RCS_head (RCSNode *rcs)
 		/* If the file is stale, get the version we locked, not HEAD */
 		do_lock_version(rcs->rcsbuf.lockId, rcs->branch?rcs->branch:"HEAD", &v);
 		if(v && v[0])
-			return xstrdup(v);
+        {
+            return v;
+        }
+        xfree(v);
 	}
 
 	/*
@@ -3720,9 +3728,8 @@ int RCS_isdead (RCSNode *rcs, const char *tag)
 }
 
 /* Return the RCS keyword expansion mode.  For example "b" for binary.
-   Returns a pointer into storage which is allocated and freed along with
-   the rest of the RCS information; the caller should not modify this
-   storage.  Returns NULL if the RCS file does not specify a keyword
+   Returns a newly allocated string which the caller must free.
+   Returns NULL if the RCS file does not specify a keyword
    expansion mode; for all other errors, die with a fatal error.  */
 char *RCS_getexpand(RCSNode *rcs, const char *vn_rcs)
 {
@@ -3940,6 +3947,9 @@ expand_keywords (RCSNode *rcs, RCSVers *ver, const char *name, const char *log,
 	else
 		dir="";
 
+    char *branch = ver ? RCS_branchfromversion(rcs,ver->version) : NULL;
+    char *pdate = ver ? printable_date(ver->date) : NULL;
+
     /* RCS keywords look like $STRING$ or $STRING: VALUE$.  */
     srch = buf;
     srch_len = len;
@@ -3970,8 +3980,6 @@ expand_keywords (RCSNode *rcs, RCSVers *ver, const char *name, const char *log,
 		if (s == send || (*s != '$' && *s != ':'))
 			continue;
 
-		const char *branch = RCS_branchfromversion(rcs,ver->version);
-
 		/* See if this is one of the keywords.  */
 		keywords_param_t args;
 		args.file = last_component(rcs->path);
@@ -3979,7 +3987,7 @@ expand_keywords (RCSNode *rcs, RCSVers *ver, const char *name, const char *log,
 		args.keyword = srch;
 		args.keyword_len = s - srch;
 		args.author = ver->author;
-		args.printable_date = printable_date(ver->date);
+        args.printable_date = pdate;
 		args.rcs_date = ver->date;
 		args.locker = locker;
 		args.state = ver->state;
@@ -4256,6 +4264,8 @@ expand_keywords (RCSNode *rcs, RCSVers *ver, const char *name, const char *log,
 
 	xfree(prop);
 	xfree(locker);
+    xfree(branch);
+    xfree(pdate);
 
 	if (ebufs == NULL)
 	{
@@ -4425,6 +4435,7 @@ int RCS_checkout_raw_value (RCSNode *rcs, const char *&rev, int &free_rev,
       	  value = (char*)zbuf;
           free_value = 1;
       	}
+        inflateEnd(&stream);
       	len = zlen;
       }
     }
