@@ -18,8 +18,11 @@ Exit status is 0 if every test passed.
 
 import argparse
 import contextlib
+import getpass
 import os
 import re
+import select
+import shlex
 import shutil
 import socket
 import struct
@@ -27,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 CVS = None
 LIBDIR = None
@@ -193,6 +197,20 @@ VALID_RESPONSES = (
     "Clear-static-directory Set-sticky Clear-sticky Template "
     "Notified Module-expansion Clear-rename Rename EntriesExtra "
     "M Mbinary E F MT")
+
+
+def server_cmd(repo, verb="server"):
+    """The command line of a server for REPO.  An authserver gets no
+    --allow-root: that one would hide CVSROOT/passwd from the login, so its
+    root must come from Repository<n> in CVSCONF/PServer."""
+    allow = ["--allow-root=" + repo] if verb != "authserver" else []
+    return [CVS] + (["-L", LIBDIR] if LIBDIR else []) + allow + [verb]
+
+
+def session_preamble(r):
+    """The Root / Valid-responses / UseUnchanged requests a client opens with."""
+    return ["Root " + r.repo.replace(os.sep, "/"), "Valid-responses " + VALID_RESPONSES,
+            "UseUnchanged"]
 
 
 def server_session(r, reqs, env=None):
@@ -2689,6 +2707,633 @@ def t_long_repository_path(r):
     # module-lookup guard, which names the over-long path.
     check_clean("rlog", ["Argument " + long_rel, "rlog"],
                 expect_msg="Repository path too long for module lookup")
+
+
+# --------------------------------------------------------------------------- lost client
+# A server session must end soon after its client is gone: blocked on a
+# write, walking without output, or after a hook has run (CRunFile leaves
+# SIGPIPE ignored behind it).  A command that writes the repository finishes
+# first, with its output dropped; a filesystem lock wait ends either way.
+# server_session's communicate() and PserverShim keep reading or kill the
+# server, so these sessions own the server's fd 0/1 themselves.
+
+LOST_CLIENT_BOUND = 30          # seconds; a fixed server is gone in about one
+SESSION_SOCKBUF = 16 * 1024     # both ends, so the walk outruns the buffering
+GATE_HOLD = 1.2                 # seconds; longer than the server's 1 s poll throttle
+WALK_DIRS = 12
+FIRST_FILE = re.compile(rb"(?m)^(?:Created|Updated|Update-existing) ")
+LISTING_LINE = re.compile(rb"(?m)^M mod\d")
+
+
+class LiveSession:
+    """A server for r.repo whose fd 0/1 the test owns: a pipe pair, or one
+    end of a socketpair or loopback TCP connection that the server gets as
+    both.  TMPDIR is a directory of its own, stderr goes to a file, and
+    every read and the final wait have a deadline."""
+
+    def __init__(self, r, transport="pipe", verb="server", env=None):
+        self.tmp = tempfile.mkdtemp(dir=r.root, prefix="tmp")
+        self.errpath = self.tmp + ".err"
+        self.out = b""
+        self.sock = srv = None
+        if transport == "socketpair":
+            self.sock, srv = socket.socketpair()
+        elif transport == "tcp":
+            lsn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            lsn.bind(("127.0.0.1", 0))
+            lsn.listen(1)
+            self.sock = socket.create_connection(lsn.getsockname(), timeout=LOST_CLIENT_BOUND)
+            srv = lsn.accept()[0]
+            lsn.close()
+        if srv is not None:
+            for s in (self.sock, srv):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SESSION_SOCKBUF)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SESSION_SOCKBUF)
+            srv.setblocking(True)
+            self.sock.settimeout(LOST_CLIENT_BOUND)
+            fds = {"stdin": srv.fileno(), "stdout": srv.fileno()}
+        else:
+            fds = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE}
+        env = dict(os.environ, TMPDIR=self.tmp, **(env or {}))
+        try:
+            with open(self.errpath, "wb") as err:
+                self.p = subprocess.Popen(server_cmd(r.repo, verb), cwd=r.root, stderr=err,
+                                          env=env, **fds)
+        finally:
+            if srv is not None:
+                srv.close()
+        self.rfd = self.sock.fileno() if self.sock else self.p.stdout.fileno()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.p.poll() is None:
+            self.p.kill()
+            self.p.wait()
+        self.hang_up()
+
+    def send(self, reqs):
+        data = "".join(s + "\n" for s in reqs).encode("utf-8")
+        if self.sock:
+            self.sock.sendall(data)
+        else:
+            self.p.stdin.write(data)
+            self.p.stdin.flush()
+
+    def read_until(self, done, timeout=LOST_CLIENT_BOUND):
+        """Read until done(output) holds, EOF or the deadline; return done(output).
+        done may watch a hook's markers, so it is retried without new output."""
+        deadline = time.monotonic() + timeout
+        while not done(self.out):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            if not select.select([self.rfd], [], [], min(left, 0.05))[0]:
+                continue
+            try:
+                data = os.read(self.rfd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            self.out += data
+        return bool(done(self.out))
+
+    def close_output(self):
+        # The client stops reading; its end of the server's stdin stays open.
+        self.p.stdout.close()
+
+    def hang_up(self):
+        # The client is gone: everything the test holds is closed.
+        if self.sock:
+            self.sock.close()
+        for f in (self.p.stdin, self.p.stdout):
+            if f:
+                try:
+                    f.close()
+                except OSError:
+                    pass
+
+    def wait(self):
+        """The exit status within LOST_CLIENT_BOUND seconds, or None after a kill."""
+        try:
+            return self.p.wait(timeout=LOST_CLIENT_BOUND)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+            return None
+
+    def leftovers(self):
+        return [n for n in os.listdir(self.tmp) if n.startswith("cvs-serv")]
+
+    def report(self):
+        return "output tail:\n%s\nstderr:\n%s" % (
+            self.out[-400:].decode("utf-8", "replace"), read(self.errpath))
+
+
+def _lost_client_skipped():
+    if os.name == "nt":
+        print("          (skipped: client loss is detected through POSIX poll and write errors)")
+        return True
+    return False
+
+
+def _admin_write(r, name, text):
+    path = os.path.join(r.repo, "CVSROOT", name)
+    if os.path.exists(path):
+        os.chmod(path, 0o644)  # cvs init leaves the administrative files read-only
+    write(path, text)
+
+
+def _hook(r, admin, extra="", args=""):
+    # CVSROOT/<admin> runs a script for every match, with ARGS on its line.
+    # Each run appends its arguments to the returned marker file, which
+    # starts empty, so a test can tell that the hook ran.
+    marks = os.path.join(r.root, admin + ".marks")
+    script = os.path.join(r.root, admin + ".sh")
+    write(script, 'echo "$*" >> %s\n%s' % (shlex.quote(marks), extra))
+    write(marks, "")
+    _admin_write(r, admin, "ALL /bin/sh %s %s\n" % (script, args))
+    return marks
+
+
+def _marks(path):
+    return read(path).splitlines()
+
+
+def _gated_hook(r, admin, k, extra="", args=""):
+    # A _hook whose K-th run holds, the server with it, until the returned
+    # release file exists or LOST_CLIENT_BOUND seconds have passed.
+    marks = shlex.quote(os.path.join(r.root, admin + ".marks"))
+    release = os.path.join(r.root, admin + ".release")
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(release)
+    gate = ('if [ $(wc -l < %s) -eq %d ]; then\n  i=0\n'
+            '  while [ ! -e %s ] && [ $i -lt %d ]; do sleep 0.05; i=$((i+1)); done\nfi\n'
+            % (marks, k, shlex.quote(release), LOST_CLIENT_BOUND * 20))
+    return _hook(r, admin, extra + gate, args), release
+
+
+def _reach_gate(s, marks, k, what):
+    # Reading on, or a chatty command stalls on the buffers before the gate.
+    return check(s.read_until(lambda _: len(_marks(marks)) >= k),
+                 "%s: the walk never reached hook run %d\n%s" % (what, k, s.report()))
+
+
+def _release_gate(release):
+    # Call after the hang-up.  The hold outlasts the poll throttle, so the
+    # server's next checkpoint polls.
+    time.sleep(GATE_HOLD)
+    write(release, "")
+
+
+def _walk_repo(r):
+    # Module m: WALK_DIRS directories of 8 files of 12 KB, about 1.2 MB of
+    # checkout responses, many times what a pipe or the socket buffers hold.
+    body = "".join("%063d\n" % i for i in range(192))
+    r.import_tree("m", {"d%02d/f%d.txt" % (d, f): body
+                        for d in range(WALK_DIRS) for f in range(8)})
+
+
+def _walk_files():
+    return [("d%02d" % d, "f%d.txt" % f) for d in range(WALK_DIRS) for f in range(8)]
+
+
+def _modified(name, rev, text):
+    # The requests of one changed file; TEXT ends in a newline.
+    return ["Entry /%s/%s///" % (name, rev), "Modified " + name, "u=rw,g=r,o=r",
+            str(len(text)), text[:-1]]
+
+
+# Without -m a raw ci reads its log message from stdin.
+COMMIT_REQS = ["Argument -m", "Argument lost client", "ci"]
+
+
+def _walk_commit(r):
+    # A raw ci that changes every file of _walk_repo.
+    top = r.repo.replace(os.sep, "/") + "/m"
+    reqs = session_preamble(r)
+    for d, f in _walk_files():
+        if f == "f0.txt":
+            reqs += ["Directory " + d, top + "/" + d]
+        reqs += _modified(f, "1.1.1.1", "changed %s/%s\n" % (d, f))
+    return reqs + ["Directory .", top] + COMMIT_REQS
+
+
+def _rcs_head(r, rel):
+    return re.search(r"(?m)^head\s+([\d.]*);", read(os.path.join(r.repo, rel + ",v"))).group(1)
+
+
+def _walk_heads(r):
+    return {_rcs_head(r, "m/%s/%s" % f) for f in _walk_files()}
+
+
+def _lock_debris(r):
+    return [n for _, ds, fs in os.walk(r.repo) for n in ds + fs if n.startswith("#cvs.")]
+
+
+def _check_ends_after_loss(s, what):
+    # A session that lost its client exits 1 (not 0, not a signal) within
+    # the bound, and server_cleanup has removed its temp tree.
+    t0 = time.monotonic()
+    rc = s.wait()
+    if rc is None:
+        fail("%s: the server still ran %d s after its client was gone (killed)\n%s"
+             % (what, LOST_CLIENT_BOUND, s.report()))
+        return
+    if VERBOSE:
+        print("      %s: exit %d after %.1f s" % (what, rc, time.monotonic() - t0))
+    check_eq(rc, 1, "%s: server exit status (%s)" % (what, s.report()))
+    check(not s.leftovers(), "%s: the server left %s in its TMPDIR" % (what, s.leftovers()))
+
+
+@test("a server whose client stops reading mid-checkout exits, with or without a hook")
+def t_server_client_stops_reading(r):
+    # The client stops reading but its end of stdin stays open.  Without a
+    # hook the old server died of SIGPIPE; after one it finished the walk
+    # and waited for the next request.
+    if _lost_client_skipped():
+        return
+    root = r.repo.replace(os.sep, "/")
+    _walk_repo(r)
+    for hooked in (False, True):
+        what = "co over a pipe with%s a precommand hook" % ("" if hooked else "out")
+        marks = _hook(r, "precommand") if hooked else None
+        with LiveSession(r) as s:
+            s.send(session_preamble(r) + ["Argument m", "Directory .", root, "co"])
+            if check(s.read_until(FIRST_FILE.search),
+                     "%s: no file response arrived\n%s" % (what, s.report())):
+                s.close_output()
+                _check_ends_after_loss(s, what)
+        if hooked:
+            check(_marks(marks), "%s: the hook never ran" % what)
+
+
+@test("a server that loses its client during a co -c listing exits, over a pipe and over pserver")
+def t_server_client_lost_listing(r):
+    # co -c prints CVSROOT/modules through cvs_output and never recurses, so
+    # no walk checkpoint runs: the failed write itself (fd_buffer_output, or
+    # client_protocol_buffer_output under authserver) must mark the client
+    # gone for the session to end after the command.
+    if _lost_client_skipped():
+        return
+    import pwd
+    root = r.repo.replace(os.sep, "/")
+    _admin_write(r, "modules", "".join("mod%05d -a m\n" % i for i in range(20000)))
+    listing = ["Argument -c", "Directory .", root, "co"]
+    marks = None
+    for hooked in (False, True):
+        what = "co -c over a pipe with%s a precommand hook" % ("" if hooked else "out")
+        marks = _hook(r, "precommand") if hooked else None
+        with LiveSession(r) as s:
+            s.send(session_preamble(r) + listing)
+            if check(s.read_until(LISTING_LINE.search),
+                     "%s: no listing arrived\n%s" % (what, s.report())):
+                s.close_output()
+                _check_ends_after_loss(s, what)
+        if hooked:
+            check(_marks(marks), "%s: the hook never ran" % what)
+
+    # authserver on a socket, logged in through CVSROOT/passwd as the
+    # current user; the precommand hook is still configured.  CVSCONF
+    # replaces the whole PServer file, LockServer included.
+    what = "co -c under authserver with a precommand hook"
+    write(marks, "")
+    _admin_write(r, "passwd", "shim::%s\n" % pwd.getpwuid(os.getuid()).pw_name)
+    cfg = os.path.join(r.repo, "CVSROOT", "config")
+    _admin_write(r, "config", read(cfg) + "\nSystemAuth=no\nLockServer=none\n")
+    conf = os.path.join(r.root, "conf")
+    write(os.path.join(conf, "PServer"), "Repository0=%s\nRepository0Name=%s\n" % (root, root))
+    with LiveSession(r, "socketpair", verb="authserver", env={"CVSCONF": conf}) as s:
+        s.send(["BEGIN AUTH REQUEST", root, "shim", "A", "END AUTH REQUEST"])
+        s.read_until(lambda o: b"\n" in o)
+        if check(s.out.startswith(b"I LOVE YOU\n"),
+                 "%s: the login was refused\n%s" % (what, s.report())):
+            s.send(session_preamble(r) + listing)
+            if check(s.read_until(LISTING_LINE.search),
+                     "%s: no listing arrived\n%s" % (what, s.report())):
+                s.hang_up()
+                _check_ends_after_loss(s, what)
+    check(_marks(marks), "%s: the hook never ran" % what)
+
+
+@test("a server whose client closes its socket mid-walk exits, even while the walk prints nothing")
+def t_server_client_closes_socket(r):
+    if _lost_client_skipped():
+        return
+    root = r.repo.replace(os.sep, "/")
+    _walk_repo(r)
+    what = "co over a socket with a precommand hook"
+    marks = _hook(r, "precommand")
+    with LiveSession(r, "socketpair") as s:
+        s.send(session_preamble(r) + ["Argument m", "Directory .", root, "co"])
+        if check(s.read_until(FIRST_FILE.search),
+                 "%s: no file response arrived\n%s" % (what, s.report())):
+            s.hang_up()
+            _check_ends_after_loss(s, what)
+    check(_marks(marks), "%s: the hook never ran" % what)
+
+    # rlog -S selects no revision here, so it writes nothing before its ok
+    # and no failed write can notice the hang-up.  It runs per argument and
+    # premodule fires for each, so the gate holds it at the third directory.
+    # A real client's -Q sends both options; %o stops the default arguments,
+    # whose %p premodule answers with a warning that would be output.
+    rlog = ["Global_option -q", "Global_option -Q", "Argument -S", "Argument -d",
+            "Argument 1970-01-01"]
+    dirs = ["m/d%02d" % d for d in range(WALK_DIRS)]
+    rlog += ["Argument " + d for d in dirs] + ["Directory .", root, "rlog"]
+    rlogmarks = _hook(r, "premodule", args="%o")
+    check_eq(server_session(r, session_preamble(r) + rlog)[1], "ok\n", "silent rlog: its output")
+    check_eq(_marks(rlogmarks), dirs, "silent rlog: premodule runs")
+    cases = [("socketpair", [])]
+    if sys.platform.startswith("linux"):
+        # A request sent during the walk stays unread in the kernel ahead of
+        # the FIN; only POLLRDHUP reports the FIN behind it.
+        cases.append(("tcp", ["noop"]))
+    else:
+        print("          (queued-request case skipped: POLLRDHUP is Linux only)")
+    for transport, trailing in cases:
+        what = "silent rlog over a %s%s" % (transport, " with a queued noop" if trailing else "")
+        rlogmarks, release = _gated_hook(r, "premodule", 3, args="%o")
+        with LiveSession(r, transport) as s:
+            s.send(session_preamble(r) + rlog)
+            if not _reach_gate(s, rlogmarks, 3, what):
+                continue
+            s.send(trailing)
+            s.hang_up()
+            _release_gate(release)
+            _check_ends_after_loss(s, what)
+        check_eq(_marks(rlogmarks), dirs[:3], "%s: premodule runs" % what)
+
+
+@test("a server waiting for a filesystem lock exits when its client closes the socket")
+def t_server_client_lost_lock_wait(r):
+    # Without a lock server, a read lock retries every CVSLCKSLEEP (15) s
+    # for as long as #cvs.lock exists; this one is far younger than
+    # CVSLCKAGE.  Only the retry itself can notice the hang-up.
+    if _lost_client_skipped():
+        return
+    root = r.repo.replace(os.sep, "/")
+    r.import_tree("m", {"a.txt": "one\n", "sub/b.txt": "two\n"})
+    cfg = os.path.join(r.repo, "CVSROOT", "config")
+    _admin_write(r, "config", read(cfg) + "\nLockServer=none\n")
+    lockdir = os.path.join(r.repo, "m", "sub", "#cvs.lock")
+    os.mkdir(lockdir)
+    what = "co over a socket waiting for a lock, with a precommand hook"
+    marks = _hook(r, "precommand")
+    try:
+        with LiveSession(r, "socketpair") as s:
+            s.send(session_preamble(r) + ["Argument m", "Directory .", root, "co"])
+            if check(s.read_until(re.compile(rb"(?m)^E .*waiting for .*lock in ").search),
+                     "%s: no lock wait was reported\n%s" % (what, s.report())):
+                s.hang_up()
+                _check_ends_after_loss(s, what)
+    finally:
+        os.rmdir(lockdir)
+    check(_marks(marks), "%s: the hook never ran" % what)
+
+
+@test("a commit that loses its client commits every file and runs loginfo for each, then exits")
+def t_server_client_lost_commit_completes(r):
+    # loginfo runs once per directory, after that directory's revisions, and
+    # the gate holds the third.  File locks in one case: only those leave
+    # #cvs.* behind if the commit stops.
+    if _lost_client_skipped():
+        return
+    for transport, config in (("socketpair", ""), ("pipe", "\nLockServer=none\n")):
+        what = "ci over a %s%s" % (transport, " with file locks" if config else "")
+        rr = Repo(os.path.join(r.root, transport))
+        _walk_repo(rr)
+        cfg = os.path.join(rr.repo, "CVSROOT", "config")
+        _admin_write(rr, "config", read(cfg) + config)
+        marks, release = _gated_hook(rr, "loginfo", 3, "cat > /dev/null\n", "%s")
+        with LiveSession(rr, transport) as s:
+            s.send(_walk_commit(rr))
+            if not _reach_gate(s, marks, 3, what):
+                continue
+            if transport == "pipe":
+                s.close_output()
+            else:
+                s.hang_up()
+            _release_gate(release)
+            _check_ends_after_loss(s, what)
+        check_eq(_walk_heads(rr), {"1.2"}, "%s: head revisions" % what)
+        names = " ".join("f%d.txt" % f for f in range(8))
+        check_eq(_marks(marks), ["m/d%02d %s" % (d, names) for d in range(WALK_DIRS)],
+                 "%s: loginfo runs" % what)
+        check_eq(_lock_debris(rr), [], "%s: lock files left" % what)
+
+
+@test("a CVSROOT commit that loses its client still rebuilds the administrative file")
+def t_server_client_lost_cvsroot_commit(r):
+    # The gate holds commitinfo, ahead of any revision: mkmodules follows
+    # loginfo with no checkpoint between them, so only a loss this early
+    # shows that the commit gets as far as mkmodules.  The ACL of cvs init
+    # lets only an admin write under CVSROOT.
+    if _lost_client_skipped():
+        return
+    _admin_write(r, "admin", getpass.getuser() + "\n")
+    what = "ci of CVSROOT/modules over a socket"
+    top = r.repo.replace(os.sep, "/") + "/CVSROOT"
+    head = _rcs_head(r, "CVSROOT/modules")
+    text = "lost -a m\n"
+    marks, release = _gated_hook(r, "commitinfo", 1)
+    with LiveSession(r, "socketpair") as s:
+        s.send(session_preamble(r) + ["Directory .", top] + _modified("modules", head, text)
+               + COMMIT_REQS)
+        if _reach_gate(s, marks, 1, what):
+            s.hang_up()
+            _release_gate(release)
+            _check_ends_after_loss(s, what)
+    check(_rcs_head(r, "CVSROOT/modules") != head, "%s: no new revision" % what)
+    check_eq(read(os.path.join(r.repo, "CVSROOT", "modules")), text,
+             "%s: the checked-out file" % what)
+
+
+@test("an rtag that loses its client tags every file, then exits")
+def t_server_client_lost_rtag_completes(r):
+    # taginfo runs once per directory in the validation pass, ahead of any
+    # rewrite, so a stop at the gate would leave no tag at all.  Every
+    # command flagged as writing the repository finishes, not commit alone.
+    if _lost_client_skipped():
+        return
+    what = "-Q rtag over a socket"
+    root = r.repo.replace(os.sep, "/")
+    _walk_repo(r)
+    marks, release = _gated_hook(r, "taginfo", 3)
+    with LiveSession(r, "socketpair") as s:
+        s.send(session_preamble(r) + ["Global_option -Q", "Argument T1", "Argument m",
+                                      "Directory .", root, "rtag"])
+        if _reach_gate(s, marks, 3, what):
+            s.hang_up()
+            _release_gate(release)
+            _check_ends_after_loss(s, what)
+    check_eq(len(_marks(marks)), WALK_DIRS, "%s: taginfo runs" % what)
+    untagged = [f for f in _walk_files()
+                if not re.search(r"\sT1:", read(os.path.join(r.repo, "m", f[0], f[1] + ",v"))
+                                 .split("\ndesc", 1)[0])]
+    check_eq(untagged, [], "%s: files without the tag" % what)
+
+
+@test("a commit waiting for a filesystem lock exits when its client goes, and commits nothing")
+def t_server_client_lost_commit_lock_wait(r):
+    # The wait has no end of its own and comes ahead of every revision, so
+    # it ends the session even for a write.  Only the next retry, up to
+    # CVSLCKSLEEP (15 s) away, can notice.  The hook stops an old server
+    # dying of SIGPIPE at that retry.
+    if _lost_client_skipped():
+        return
+    what = "ci over a socket waiting for a lock, with a precommand hook"
+    _walk_repo(r)
+    cfg = os.path.join(r.repo, "CVSROOT", "config")
+    _admin_write(r, "config", read(cfg) + "\nLockServer=none\n")
+    lockdir = os.path.join(r.repo, "m", "d05", "#cvs.lock")
+    os.mkdir(lockdir)
+    marks = _hook(r, "precommand")
+    try:
+        with LiveSession(r, "socketpair") as s:
+            s.send(_walk_commit(r))
+            if check(s.read_until(re.compile(rb"(?m)^E .*waiting for .*lock in ").search),
+                     "%s: no lock wait was reported\n%s" % (what, s.report())):
+                s.hang_up()
+                _check_ends_after_loss(s, what)
+    finally:
+        os.rmdir(lockdir)
+    check_eq(_walk_heads(r), {"1.1"}, "%s: head revisions" % what)
+    check_eq(_lock_debris(r), [], "%s: lock files left" % what)
+    check(_marks(marks), "%s: the hook never ran" % what)
+
+
+LOCKD_SOCKET = "/tmp/lockserver_addr.sock"      # lockservice_uds_name.h
+
+
+def _lockd_connect():
+    # A signed-on connection to this run's lock server and the LockServer
+    # value naming it, or None: CVSCONF/PServer, else the default, where
+    # lock.cpp swaps localhost for the AF_UNIX socket, else TCP.  macOS can
+    # accept on that socket and never sign on.
+    conf = os.environ.get("CVSCONF", "")
+    pserver = os.path.join(conf, "PServer")
+    named = conf and os.path.exists(pserver) and re.search(r"(?m)^LockServer=(\S+)", read(pserver))
+    for server in ([named.group(1)] if named else ["localhost:2402", "127.1:2402"]):
+        host, _, port = server.partition(":")
+        unix = host in ("localhost", "127.0.0.1")
+        s = socket.socket(socket.AF_UNIX if unix else socket.AF_INET)
+        s.settimeout(LOST_CLIENT_BOUND)
+        try:
+            s.connect(LOCKD_SOCKET if unix else (host, int(port or 2402)))
+            if s.recv(1024):
+                return s, server
+        except OSError:
+            pass
+        s.close()
+    return None
+
+
+@test("a commit waiting for the lock server outlasts its client, commits every file, then exits")
+def t_server_client_lost_commit_lockd_wait(r):
+    # Unlike t_server_client_lost_commit_lock_wait, this wait ends once the
+    # holder lets go, so a write keeps waiting.  It retries every second after
+    # the 5 s ahead of the report; the hold spans two polls of a dead client.
+    # CVSROOT/config sends the server to the lock server the test reached.
+    if _lost_client_skipped():
+        return
+    found = _lockd_connect()
+    if found is None:
+        print("          (skipped: no lock server is reachable)")
+        return
+    what = "ci over a socket waiting for the lock server, with a precommand hook"
+    root = r.repo.replace(os.sep, "/")
+    holder, server = found
+    with holder:
+        cfg = os.path.join(r.repo, "CVSROOT", "config")
+        _admin_write(r, "config", read(cfg) + "\nLockServer=%s\n" % server)
+        _walk_repo(r)
+        marks = _hook(r, "precommand")
+        for req in ("Client user|%s|\n" % root, "Lock Write|%s/m/d00/f0.txt,v\n" % root):
+            holder.sendall(req.encode("utf-8"))
+            reply = holder.recv(1024)
+            if not check(reply.startswith(b"000 "), "%s: refused %r: %r" % (what, req, reply)):
+                return
+        with LiveSession(r, "socketpair") as s:
+            s.send(_walk_commit(r))
+            if check(s.read_until(re.compile(rb"(?m)^E .*waiting for .*lock in ").search),
+                     "%s: no lock wait was reported\n%s" % (what, s.report())):
+                s.hang_up()
+                time.sleep(2 * GATE_HOLD)
+                holder.close()  # releases the lock
+                _check_ends_after_loss(s, what)
+    check_eq(_walk_heads(r), {"1.2"}, "%s: head revisions" % what)
+    check(_marks(marks), "%s: the hook never ran" % what)
+
+
+@test("a read-only update stops when its client goes, it does not finish the walk")
+def t_server_client_lost_update_stops(r):
+    # The other side of the commit and rtag tests.  history gets a line per
+    # file the update handles, and a complete update shows that it counts.
+    if _lost_client_skipped():
+        return
+    what = "update over a socket with a precommand hook"
+    top = r.repo.replace(os.sep, "/") + "/m"
+    _walk_repo(r)
+    marks = _hook(r, "precommand")
+    history = os.path.join(r.repo, "CVSROOT", "history")
+    write(history, "")
+    reqs = session_preamble(r)
+    for d in range(WALK_DIRS):
+        reqs += ["Directory d%02d" % d, "%s/d%02d" % (top, d)]
+    reqs += ["Directory .", top, "update"]
+    files = len(_walk_files())
+    server_session(r, reqs)
+    check_eq(len(read(history).splitlines()), files, "history lines of a complete update")
+    write(history, "")
+    with LiveSession(r, "socketpair") as s:
+        s.send(reqs)
+        if check(s.read_until(FIRST_FILE.search),
+                 "%s: no file response arrived\n%s" % (what, s.report())):
+            s.hang_up()
+            _check_ends_after_loss(s, what)
+    check(len(read(history).splitlines()) < files,
+          "%s: the walk went on through all %d files" % (what, files))
+    check(_marks(marks), "%s: the hook never ran" % what)
+
+
+@test("a session whose client stays connected ends normally, with or without a hook")
+def t_server_client_stays(r):
+    # The other side of the lost-client checks: a client that keeps its
+    # socket open until the last response, or that closes its stdin pipe
+    # right after the last request (t_server_session covers that without a
+    # hook), is not lost.
+    if _lost_client_skipped():
+        return
+    root = r.repo.replace(os.sep, "/")
+    _walk_repo(r)
+    reqs = session_preamble(r) + ["Argument m", "Directory .", root, "co", "noop"]
+    files = WALK_DIRS * 8
+
+    def complete(what, rc, out):
+        lines = out.split(b"\n")
+        check_eq(rc, 0, "%s: server exit status" % what)
+        check_eq(lines.count(b"ok"), 2, "%s: one ok per command (co, noop)" % what)
+        check(not any(l.startswith(b"error") for l in lines), "%s: the server reported an error" % what)
+        check_eq(len(FIRST_FILE.findall(out)), files, "%s: files sent" % what)
+
+    for hooked in (False, True):
+        tail = "with%s a precommand hook" % ("" if hooked else "out")
+        marks = _hook(r, "precommand") if hooked else None
+        with LiveSession(r, "socketpair") as s:
+            s.send(reqs)
+            s.read_until(lambda o: o.split(b"\n").count(b"ok") >= 2
+                         or re.search(rb"(?m)^error", o))
+            s.hang_up()
+            complete("co + noop over a socket " + tail, s.wait(), s.out)
+            check(not s.leftovers(), "the server left %s in its TMPDIR" % s.leftovers())
+        if hooked:
+            rc, out, _ = server_session(r, reqs)
+            complete("co + noop over a pipe " + tail, rc, out.encode("utf-8"))
+            check(_marks(marks), "the hook never ran")
+
 
 
 def main():

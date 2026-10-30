@@ -353,6 +353,12 @@ static size_t do_lock_server(const char *object, const char *directory, const ch
 			error(1,0,"Unknown response from lock server: %s", line+4);
 		}
 		// Only get here in case 2 == WAIT
+#ifdef SERVER_SUPPORT
+        if (server_active)
+        {
+            server_walk_checkpoint ();
+        }
+#endif
 		sleep(1);
 	} while(1);
 	xfree(ob);
@@ -1175,6 +1181,12 @@ static void lock_wait (const char *repos)
        soon as possible.  */
     cvs_flusherr ();
     xfree (msg);
+#ifdef SERVER_SUPPORT
+    if (server_active)
+    {
+        server_lock_wait_checkpoint ();
+    }
+#endif
     (void) sleep (CVSLCKSLEEP);
 }
 

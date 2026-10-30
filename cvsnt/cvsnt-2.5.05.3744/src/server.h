@@ -121,6 +121,10 @@ extern char *server_dir;
 enum progs {PROG_CHECKIN, PROG_UPDATE};
 extern void server_prog();
 void server_cleanup (int sig);
+/* End a read-only command at a safe point if the client is gone.  */
+void server_walk_checkpoint ();
+/* The same during a filesystem lock wait, for any command.  */
+void server_lock_wait_checkpoint ();
 
 #ifdef SERVER_FLOWCONTROL
 /* Pause if it's convenient to avoid memory blowout */
