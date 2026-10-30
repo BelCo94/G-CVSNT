@@ -48,9 +48,9 @@ public:
 	CVSAPI_EXPORT const char *GetName() const;
 	CVSAPI_EXPORT const char *GetPrefix() const;
 	CVSAPI_EXPORT const char *GetAttrValue(const char *name);
-	/* Release a GetAttrValue result. It is an xmlGetProp allocation, and
-	   xmlFree is not visible outside this module, so the release has to
-	   cross the same boundary the allocation did. */
+	/* Release a GetAttrValue or GetValue result. Both are libxml
+	   allocations, and xmlFree is not visible outside this module, so the
+	   release has to cross the same boundary the allocation did. */
 	static CVSAPI_EXPORT void FreeAttrValue(const char *value);
 	CVSAPI_EXPORT bool SetAttrValue(const char *name, const char *value);
 	CVSAPI_EXPORT bool DeleteAttr(const char *name);

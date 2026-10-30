@@ -2513,6 +2513,7 @@ static void server_write_entries()
 			error(1,errno,"cannot write to %s", CVSADM_ENTEXT);
 	    }
 		xfree (p->entry);
+		xfree (p->entry_extra);
 		q = p->next;
 		xfree (p);
 		p = q;
@@ -3353,6 +3354,7 @@ void server_register(const char *name, const char *version, const char *timestam
 		{
 			strcat (entries_line, "-k");
 			strcat (entries_line, temp_options);
+			xfree (temp_options);
 		}
 	}
     strcat (entries_line, "/");

@@ -197,6 +197,7 @@ Vers_TS *Version_TS (struct file_info *finfo, const char *options, const char *t
 		}
 		TRACE(3,"Version_TS: assign_options(\"%s\",\"%s\")",PATCH_NULL(vers_ts->options),PATCH_NULL(options));
 		assign_options(&vers_ts->options,options);
+		xfree(existing_options);
 	}
 
     /*
@@ -309,9 +310,8 @@ Vers_TS *Version_TS (struct file_info *finfo, const char *options, const char *t
 			a file is binary.  */
 			if(vers_ts->vn_rcs)
 			{
-				char *rcsexpand = RCS_getexpand(rcsdata?rcsdata:finfo->rcs,vers_ts->vn_rcs);
 				xfree(vers_ts->options);
-				vers_ts->options = xstrdup(rcsexpand);
+				vers_ts->options = RCS_getexpand(rcsdata?rcsdata:finfo->rcs,vers_ts->vn_rcs);
 			}
 			assign_options(&vers_ts->options,options);
 		}

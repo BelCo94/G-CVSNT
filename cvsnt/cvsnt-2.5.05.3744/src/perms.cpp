@@ -274,7 +274,7 @@ static int cache_directory_permissions(const char *dir)
 			_fileattr_read(node, d);
 			if(node)
 			{
-				TRACE(3,"cache_directory_permissions() - cache directory(%s,%s)",PATCH_NULL(node->GetName()),PATCH_NULL(node->GetValue()));
+				TRACE(3,"cache_directory_permissions() - cache directory(%s)",PATCH_NULL(node->GetName()));
 				directory_cache[d]=node->DuplicateNode();
 			}
 			else
@@ -308,7 +308,12 @@ static bool verify_owner_acl(CXmlNodePtr acl)
     if(n->Lookup("/directory/owner"))
 	{
 		if(n->XPathResultNext())
-			return verify_valid_name(n->GetValue());
+		{
+			const char *owner = n->GetValue();
+			bool valid = verify_valid_name(owner);
+			CXmlNode::FreeAttrValue(owner);
+			return valid;
+		}
 	}
     return false;
 }
@@ -324,6 +329,16 @@ static int verify_owner_dir(const char *dir)
 		return verify_owner_acl(directory_cache[dir]);
 	TRACE(3,"verify_owner_dir() return");
 	return 0;
+}
+
+/* The last ACL message handed out; valid until the next one is stored. */
+static char *acl_message;
+
+static void set_acl_message(const char **message, const char *value)
+{
+	xfree(acl_message);
+	acl_message = xstrdup(value);
+	*message = acl_message;
 }
 
 static void verify_acl(CXmlNodePtr acl, const char *action, const char *tag, const char *merge, int& user_state, int& group_state, bool first_iteration, const char **message)
@@ -388,13 +403,13 @@ static void verify_acl(CXmlNodePtr acl, const char *action, const char *tag, con
 							{
 								/* user message overrides group message.  We won't get here twice. */
 								if(message)
-									*message = val_message;
+									set_acl_message(message, val_message);
 								user_state=-1;
 							}
 							else
 							{
 								if(message && !*message)
-									*message = val_message;
+									set_acl_message(message, val_message);
 
 								group_state = -1;
 //								valid_groups[val_user]=1;
@@ -411,10 +426,17 @@ static void verify_acl(CXmlNodePtr acl, const char *action, const char *tag, con
 							}
 						}
 					}
+					CXmlNode::FreeAttrValue(deny);
+					CXmlNode::FreeAttrValue(inherit);
 				}
 				acl->GetParent();
 			}
 		}
+		CXmlNode::FreeAttrValue(val_branch);
+		CXmlNode::FreeAttrValue(val_merge);
+		CXmlNode::FreeAttrValue(val_user);
+		CXmlNode::FreeAttrValue(val_message);
+		CXmlNode::FreeAttrValue(_val_priority);
 	} while(acl->GetSibling("acl"));
 }
 

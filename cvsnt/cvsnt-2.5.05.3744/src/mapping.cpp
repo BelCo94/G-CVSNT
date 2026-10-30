@@ -1456,6 +1456,16 @@ int close_directory()
 	if(current_directory->repository_rcsfile)
 		freercsnode(&current_directory->repository_rcsfile);
 	dellist(&current_directory->directory_mappings);
+	xfree(current_directory->repository_map_tag);
+	xfree(current_directory->repository_map_date);
+	xfree(current_directory->repository_buffer);
+	xfree(current_directory->virtual_repos);
+	xfree(current_directory->real_repos);
+	for(int m=0; m<current_directory->rename_script_count; m++)
+	{
+		xfree(current_directory->rename_script[m].from);
+		xfree(current_directory->rename_script[m].to);
+	}
 	xfree(current_directory->rename_script);
 	current_directory->rename_script_count = current_directory->rename_script_size = 0;
 	xfree(current_directory->directory_version);
