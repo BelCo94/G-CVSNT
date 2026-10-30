@@ -141,6 +141,7 @@ int annotate_width = 8;
 int trace = 0, noexec = 0, atomic_checkouts = 0, allow_trace = 0, quiet = 0;
 #ifdef SERVER_SUPPORT
 int server_active = 0;
+void server_walk_checkpoint(){}
 #endif
 FILE *trace_file_fp = NULL;
 const char *CVS_Username = "rcs_cvt";

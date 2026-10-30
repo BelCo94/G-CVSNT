@@ -1025,6 +1025,11 @@ static int do_dir_proc (Node *p, void *closure)
 	int directory_not_valid = 0;
 	int root_mapped = 0, has_wc_repos = 0;
 
+#ifdef SERVER_SUPPORT
+    if (server_active)
+	server_walk_checkpoint ();
+#endif
+
     if (fncmp (dir, CVSADM) == 0
 		|| fncmp (dir, CVSDUMMY) == 0)
     {

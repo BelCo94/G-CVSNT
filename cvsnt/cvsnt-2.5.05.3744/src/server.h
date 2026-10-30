@@ -121,6 +121,8 @@ extern char *server_dir;
 enum progs {PROG_CHECKIN, PROG_UPDATE};
 extern void server_prog();
 void server_cleanup (int sig);
+/* End the session at a safe point if the client is gone.  */
+void server_walk_checkpoint ();
 
 #ifdef SERVER_FLOWCONTROL
 /* Pause if it's convenient to avoid memory blowout */

@@ -61,6 +61,12 @@ extern int server_io_socket;
 // pointers have become invalid.
 static bool server_cleanup_already_done = false;
 
+/* A write to the client failed or the connection was seen closed:
+   nothing more is sent, and the session ends at the next safe point. */
+static bool client_gone = false;
+/* error_exit is running. */
+static bool server_exiting = false;
+
 // Size above which checksums are used rather than sending the file if a timestamp difference is detected
 int server_checksum_threshold = 1048576*5; // 5MB
 
@@ -241,7 +247,9 @@ static void server_buf_output(buffer *buf, const char *data, int len);
 #ifndef _WIN32
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <poll.h>
 #endif
+#include <time.h>
 enum {TIMEOUT_SECONDS = 10*60};//10 minutes is big enough timeout
 template <typename T> inline intptr_t handle_EINTR(T fn) {
   intptr_t res = false;
@@ -277,15 +285,15 @@ inline int blocking_socket_select_read(int fd) {
   if (!is_blocking_socket(fd))
     return 1;
 
-  fd_set fds;
-  FD_ZERO(&fds);
-  FD_SET(sock, &fds);
-
-  timeval tv;
-  tv.tv_sec = static_cast<long>(TIMEOUT_SECONDS);
-  tv.tv_usec = 0;
-
   return handle_EINTR([&]() {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+
+    timeval tv;
+    tv.tv_sec = static_cast<long>(TIMEOUT_SECONDS);
+    tv.tv_usec = 0;
+
     return select(static_cast<int>(sock + 1), &fds, nullptr, nullptr, &tv);
   });
 #else
@@ -300,15 +308,15 @@ inline int blocking_socket_select_write(int fd) {
   if (!is_blocking_socket(fd))
     return 1;
 
-  fd_set fds;
-  FD_ZERO(&fds);
-  FD_SET(sock, &fds);
-
-  timeval tv;
-  tv.tv_sec = static_cast<long>(TIMEOUT_SECONDS);
-  tv.tv_usec = 0;
-
   return handle_EINTR([&]() {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(sock, &fds);
+
+    timeval tv;
+    tv.tv_sec = static_cast<long>(TIMEOUT_SECONDS);
+    tv.tv_usec = 0;
+
     return select(static_cast<int>(sock + 1), nullptr, &fds, nullptr, &tv);
   });
 #else
@@ -318,16 +326,32 @@ inline int blocking_socket_select_write(int fd) {
 
 static inline int read_with_timeout(int fd, void* data, int len)
 {
-  if (blocking_socket_select_read(fd) <= 0)
+  int ready = blocking_socket_select_read(fd);
+  if (ready <= 0)
+  {
+    if (ready == 0)
+      errno = ETIMEDOUT;
     return -1;
+  }
   return read(fd, (char*)data, len);
 }
 
 static inline int write_with_timeout(int fd, const void* data, int len)
 {
-  if (blocking_socket_select_write(fd) <= 0)
+  int ready = blocking_socket_select_write(fd);
+  if (ready <= 0)
+  {
+    if (ready == 0)
+      errno = ETIMEDOUT;
     return -1;
-  return write(fd, (const char*)data, len);
+  }
+  int res = (int)handle_EINTR([&]() {
+    return write(fd, (const char*)data, len);
+  });
+  /* SO_SNDTIMEO expired */
+  if (res < 0 && blocking_error(errno))
+    errno = ETIMEDOUT;
+  return res;
 }
 
 static int io_getc(int fd)
@@ -438,6 +462,94 @@ static int fd_buffer_input (void *closure, char *data, int need, int size, int *
     return errno;
 }
 
+/* Mark the client gone after a failed write or a detected close;
+   returns STATUS (EIO if 0).  */
+
+static int client_output_failed (int status)
+{
+    if (!status)
+	status = EIO;
+    if (!client_gone)
+    {
+	client_gone = true;
+	if (!server_exiting && !server_cleanup_already_done)
+	    CServerIo::log (CServerIo::logNotice, "client connection lost: %s", strerror (status));
+    }
+    return status;
+}
+
+/* End the session if the client is gone; call only where error(1,...) is safe. */
+static void server_exit_if_client_gone ()
+{
+    if (client_gone && !server_exiting && !server_cleanup_already_done)
+	error_exit ();
+}
+
+/* At most once a second: push pending output and check, without
+   consuming input, whether the connection was closed.  */
+static void server_check_client ()
+{
+    static time_t last_check;
+    time_t now;
+
+    if (client_gone || !buf_to_net)
+	return;
+    now = time (NULL);
+    if (now == last_check)
+	return;
+    last_check = now;
+
+    /* Push what is queued; a dead peer then fails the write. */
+    if ((stdout_buf && !buf_empty_p (stdout_buf))
+	|| (stderr_buf && !buf_empty_p (stderr_buf))
+	|| !buf_empty_p (buf_to_net))
+    {
+	cvs_flusherr ();
+	cvs_flushout ();
+	if (client_gone)
+	    return;
+    }
+#ifndef _WIN32
+    {
+	struct pollfd p[2];
+	struct stat st;
+	int n = 1;
+	p[0].fd = STDOUT_FILENO; p[0].events = 0; p[0].revents = 0;
+	if (!fstat (STDIN_FILENO, &st) && S_ISSOCK (st.st_mode))
+	{
+	    p[1].fd = STDIN_FILENO; p[1].events = POLLIN; p[1].revents = 0;
+#ifdef POLLRDHUP
+	    p[1].events |= POLLRDHUP;
+#endif
+	    n = 2;
+	}
+	if (poll (p, n, 0) > 0)
+	{
+	    char c;
+	    if (p[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+		client_output_failed (EPIPE);
+#ifdef POLLRDHUP
+	    else if (n == 2 && (p[1].revents & (POLLRDHUP | POLLERR | POLLHUP)))
+		client_output_failed (ECONNRESET);
+#endif
+	    else if (n == 2 && (p[1].revents & (POLLIN | POLLERR | POLLHUP)))
+	    {
+		ssize_t r = recv (STDIN_FILENO, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+		if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+		    client_output_failed (r == 0 ? ECONNRESET : errno);
+	    }
+	}
+    }
+#endif
+}
+
+/* The safe-point check during a walk, a lock wait or a request.  */
+void server_walk_checkpoint ()
+{
+    server_check_client ();
+    server_exit_if_client_gone ();
+}
+
 /* The buffer output function for a buffer built on a file descriptor.  */
 
 static int fd_buffer_output (void *closure, const char *data, int have, int *wrote)
@@ -445,6 +557,8 @@ static int fd_buffer_output (void *closure, const char *data, int have, int *wro
     struct fd_buffer *fd = (struct fd_buffer *) closure;
 
     *wrote = 0;
+    if (client_gone)
+	return EPIPE;
 
     while (have > 0)
     {
@@ -465,10 +579,7 @@ static int fd_buffer_output (void *closure, const char *data, int have, int *wro
 
 	    /* Some sort of error occurred.  */
 
-	    if (nbytes == 0)
-	        return EIO;
-
-	    return errno;
+	    return client_output_failed (nbytes == 0 ? EIO : errno);
 	}
 
 	*wrote += nbytes;
@@ -605,6 +716,8 @@ static int client_protocol_buffer_output (void *closure, const char *data, int h
 	client_protocol_data *dat = (client_protocol_data*)closure;
 
     *wrote = 0;
+    if (client_gone)
+	return EPIPE;
 
     while (have > 0)
     {
@@ -614,10 +727,7 @@ static int client_protocol_buffer_output (void *closure, const char *data, int h
 	{
 	    /* Some sort of error occurred.  */
 
-	    if (nbytes == 0)
-	        return EIO;
-
-	    return errno;
+	    return client_output_failed (nbytes == 0 ? EIO : errno);
 	}
 
 	*wrote += nbytes;
@@ -2719,7 +2829,8 @@ error ENOMEM Virtual memory exhausted.\n";
      */
 
     /* If this gives an error, not much we could do.  syslog() it?  */
-    write (STDOUT_FILENO, msg, sizeof (msg) - 1);
+    if (!client_gone)
+	write (STDOUT_FILENO, msg, sizeof (msg) - 1);
 #ifdef HAVE_SYSLOG_H
     syslog (LOG_DAEMON | LOG_ERR, "virtual memory exhausted");
 #endif
@@ -2938,8 +3049,10 @@ error  \n");
 
 	/* Flush out any pending data.  */
     buf_flush (buf_to_net, 1);
+	server_exit_if_client_gone ();
 
 	errs = server_main(cmd_name, command);
+	server_exit_if_client_gone ();
 
     buf_flush(stderr_buf, 1);
     buf_flush(stdout_buf, 1);
@@ -2978,7 +3091,8 @@ free_args_and_return:
 /* Called by error_exit() to flush final error messages before closedown */
 void server_error_exit()
 {
-	if (buf_to_net)
+	server_exiting = true;
+	if (buf_to_net && !client_gone)
 	{
 		buf_output0 (buf_to_net, "error  \n");
 		set_block (buf_to_net);
@@ -4943,11 +5057,12 @@ int server (int argc, char **argv)
 #ifdef SIGQUIT
     (void) SIG_register (SIGQUIT, server_cleanup);
 #endif
-#ifdef SIGPIPE
-    (void) SIG_register (SIGPIPE, server_cleanup);
-#endif
 #ifdef SIGTERM
     (void) SIG_register (SIGTERM, server_cleanup);
+#endif
+#ifdef SIGPIPE
+    /* A lost client shows up as a failed write instead.  */
+    (void) signal (SIGPIPE, SIG_IGN);
 #endif
 
     /* Now initialize our argument vector (for arguments from the client).  */
@@ -5080,6 +5195,7 @@ error ENOMEM Virtual memory exhausted.\n");
             (*rq->func) (cmd);
 			buf_send_output(stderr_buf);
 			buf_send_output(stdout_buf);
+			server_exit_if_client_gone ();
 		break;
 	    }
 	}
@@ -6356,6 +6472,7 @@ void cvs_flushout_perfile ()
 #ifdef SERVER_SUPPORT
 	if (server_active)
 	{
+		server_walk_checkpoint ();
 		if ((!stdout_buf || buf_empty_p (stdout_buf))
 		    && (!stderr_buf || buf_empty_p (stderr_buf))
 		    && (!buf_to_net || buf_chunk_count (buf_to_net) <= 1))

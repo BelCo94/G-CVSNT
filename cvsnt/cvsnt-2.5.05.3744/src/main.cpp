@@ -1266,6 +1266,12 @@ int main (int argc, char **argv)
 			setsockopt(_get_osfhandle(server_io_socket),IPPROTO_TCP,TCP_NODELAY,(const char *)&nodelay,sizeof(nodelay));
 #else
 			setsockopt(0,IPPROTO_TCP,TCP_NODELAY,(const char *)&nodelay,sizeof(nodelay));
+			/* Bound a blocking write to a client that stopped reading. */
+			{
+				enum { TIMEOUT_SECONDS_SND = 10*60 };
+				struct timeval sndtmo = { TIMEOUT_SECONDS_SND, 0 };
+				setsockopt(0,SOL_SOCKET,SO_SNDTIMEO,(const char *)&sndtmo,sizeof(sndtmo));
+			}
 #endif
 		}
 		else
